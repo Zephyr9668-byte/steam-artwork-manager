@@ -1,0 +1,1855 @@
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <curl/curl.h>
+#include <sys/stat.h>
+#include <stdint.h>
+#include <inttypes.h>
+#include <time.h>
+#include <dirent.h>
+#include "string-helpers.h"
+#include "curl-helper.h"
+#include "gui-helper.h"
+#include "crc.h"
+
+#define VERSION "1.4.4" // this is also parsed by the makefile for dist
+#define API_VERSION "3"
+#define API_USER_AGENT "steam-artwork-manager/v" VERSION
+
+typedef struct AppStruct
+{
+	int index;
+	char name[300];
+	char appid[128];
+	char appid_old[128];
+	char type[50];
+} AppStruct;
+
+#ifdef __APPLE__
+#define OS_Mac 1
+#endif
+#ifdef __linux__
+#define OS_Linux 1
+#endif
+
+// Shims for Unix systems
+#if defined(OS_Mac) || defined(OS_Linux)
+#define FALSE 0
+#define TRUE 1
+
+#ifndef MAX_PATH
+#ifdef PATH_MAX
+#define MAX_PATH PATH_MAX
+#else
+#define MAX_PATH 1024
+#endif
+#endif
+
+#define WCHAR char
+#define LPSTR char*
+#include <unistd.h>
+
+// Windows Only APIs
+#elif defined(_WIN32) || defined(WIN32)
+#define OS_Windows 1
+#include <windows.h>
+int symlink(char* a, char* b) {
+	return CreateHardLink(b, a, NULL);
+}
+
+// Get value from registry
+char* getWindowsRegistryString(HKEY key, char* subKey, char* value) {
+	HKEY hKey;
+	LONG lResult;
+	DWORD dwType = REG_SZ;
+	DWORD dwSize = MAX_PATH;
+	char* regValue = malloc(MAX_PATH);
+
+	if (RegOpenKeyExA(key, subKey, 0, KEY_READ, &hKey) != ERROR_SUCCESS) {
+		return NULL;
+	}
+
+	if (strcmp(value, "default") == 0) {
+		lResult = RegQueryValueA(key, subKey, (LPSTR)regValue, &dwSize);
+	} else {
+		lResult = RegQueryValueExA(hKey, value, NULL, &dwType, (LPBYTE)regValue, &dwSize);
+	}
+
+	if (lResult != ERROR_SUCCESS) {
+		RegCloseKey(hKey);
+		return NULL;
+	}
+
+	RegCloseKey(hKey);
+
+	return regValue;
+}
+
+// Set value in registry
+int setWindowsRegistryString(HKEY key, char* subKey, char* valueName, char* valueData) {
+	HKEY hKey;
+	LONG lResult;
+
+	// Create or open the registry key
+	lResult = RegCreateKeyExA(key, subKey, 0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKey, NULL);
+
+	if (lResult != ERROR_SUCCESS) {
+		//return NULL;
+	}
+
+	// Set the string value (REG_SZ)
+	if (strcmp(valueName, "default") == 0) {
+		lResult = RegSetValueA(key, subKey, REG_SZ, (const BYTE *)valueData, (DWORD)strlen(valueData) + 1);
+	} else {
+		lResult = RegSetValueExA(hKey, valueName, 0, REG_SZ, (const BYTE *)valueData, (DWORD)strlen(valueData) + 1);
+	}
+
+	RegCloseKey(hKey);
+	return (lResult == ERROR_SUCCESS);
+}
+#endif
+
+unsigned int _nonSteamAppsCount = 0;
+unsigned int _steamAppsCount = 0;
+unsigned int _modsCount = 0;
+unsigned int _sourceModsCount = 0;
+unsigned int _goldSourceModsCount = 0;
+unsigned int _apiReturnedLines = 0;
+unsigned int DEBUG = 0;
+
+// Get logfile path
+char* getLogFilepath() {
+	char* logFilepath = malloc(MAX_PATH);
+
+#if OS_Windows
+	WCHAR path[MAX_PATH];
+	GetModuleFileName(NULL, (LPSTR)path, MAX_PATH);
+	char* filename = (char*)path;
+	while (strstr(filename, "\\") > 0) {
+		filename = strstr(filename, "\\") + 1;
+	}
+	*filename = '\0';
+	strcpy(logFilepath, (const char*)path);
+	strcat(logFilepath, "steam-artwork-manager.log");
+#elif OS_Linux
+	if (getenv("XDG_STATE_HOME") != NULL && strlen(getenv("XDG_STATE_HOME")) > 0) {
+		strcpy(logFilepath, getenv("XDG_STATE_HOME"));
+	}
+	else {
+		strcpy(logFilepath, getenv("HOME"));
+		strcat(logFilepath, "/.local/state");
+	}
+
+	// Try creating folder
+	if (access(logFilepath, 0) != 0) {
+		mkdir(logFilepath, 0700);
+	}
+
+	strcat(logFilepath, "/steam-artwork-manager.log");
+#elif OS_Mac
+	strcpy(logFilepath, getenv("HOME"));
+	strcat(logFilepath, "/Library/Logs/steam-artwork-manager.log");
+#endif
+
+	return logFilepath;
+}
+
+// Log messages
+void logMessage(const char* message, const int identifier)
+{
+	time_t now = time(0);
+	time_t rawtime;
+	struct tm* timeinfo;
+	time(&rawtime);
+	timeinfo = localtime(&rawtime);
+
+	char* logFilepath = getLogFilepath();
+
+	char messageType[10];
+	if (identifier == 0) {
+		strcpy(messageType, "[INFO]");
+	} else {
+		strcpy(messageType, "[ERROR]");
+	}
+
+	FILE* logFile = fopen(logFilepath, "a");
+	if (logFile == NULL) {
+		logFile = fopen(logFilepath, "w");
+	}
+	if (logFile) {
+		fprintf(logFile, "%s%s %s [%d]\n\n", asctime(timeinfo), messageType, message, identifier);
+		fclose(logFile);
+		printf("Logged to %s\n", logFilepath);
+	}
+}
+
+// Log an error and exit with the given error code
+void exitWithError(const char* errorMessage, const int errorCode) {
+	logMessage(errorMessage, errorCode);
+	exit(errorCode);
+}
+
+void cleanupOldAssetFiles(const char* finalPath)
+{
+	// Copy final path and strip the extension
+	char basePath[MAX_PATH];
+	strcpy(basePath, finalPath);
+
+	char* dot = strrchr(basePath, '.');
+	if (dot) *dot = '\0';
+
+	const char* extensions[] = { ".jpg", ".jpeg", ".png" }; // Steam only reads from these
+
+	for (int i = 0; i < 3; i++) {
+		char tempPath[MAX_PATH];
+		strcpy(tempPath, basePath);
+		strcat(tempPath, extensions[i]);
+
+		remove(tempPath);
+	}
+}
+
+
+// Call the BOOP API
+char*** callAPI(char* grid_types, char* grid_ids, char* mode)
+{
+	char authHeader[] = "Authorization: Bearer 62696720-6f69-6c79-2070-65656e75733f";
+	char apiVersionHeader[20] = "X-BOOP-API-VER: ";
+	strcat(apiVersionHeader, API_VERSION);
+	char* url = malloc(512);
+	char*** valuesArray = malloc((sizeof(char**)) * 500);
+
+	strcpy(url, "https://www.steamgriddb.com/api/steam-artwork-manager/");
+	strcat(url, grid_types);
+	strcat(url, "/");
+	strcat(url, grid_ids);
+
+	if (strcmp(mode, "nonsteam") == 0) {
+		strcat(url, "?nonsteam=1");
+	}
+
+	CURL* curl;
+	CURLcode res;
+	struct curl_slist* headers = NULL;
+	curl = curl_easy_init();
+	if (curl)
+	{
+		struct string s;
+		init_string(&s);
+
+		curl_easy_setopt(curl, CURLOPT_URL, url);
+		curl_easy_setopt(curl, CURLOPT_WRITEDATA, &s);
+		curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writefunc);
+		curl_easy_setopt(curl, CURLOPT_FAILONERROR, FALSE);
+		curl_easy_setopt(curl, CURLOPT_USERAGENT, API_USER_AGENT);
+		curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, TRUE);
+		headers = curl_slist_append(headers, authHeader);
+		headers = curl_slist_append(headers, apiVersionHeader);
+		curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+		res = curl_easy_perform(curl);
+		long http_code = 0;
+		curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+		curl_easy_cleanup(curl);
+
+		if (http_code >= 400)
+		{
+			char* message = malloc(1000);
+			strcpy(message, "API Error: ");
+			strcat(message, s.ptr);
+
+			if (startsWith(s.ptr, "error-")) {
+				message = strreplace(message, "error-", "");
+				ShowMessageBox("steam-artwork-manager Error", message);
+			}
+			exitWithError(message, (int)http_code);
+		}
+
+		char* line = s.ptr;
+
+		while (strstr(line, "\r") > 0) {
+			char* endLine = strstr(line, "\r");
+			*endLine = '\0';
+
+			valuesArray[_apiReturnedLines] = malloc((sizeof(char**)) * 2048);
+			valuesArray[_apiReturnedLines][0] = line;
+			valuesArray[_apiReturnedLines][1] = strstr(line, ",");
+			*valuesArray[_apiReturnedLines][1] = '\0';
+			valuesArray[_apiReturnedLines][1] += 1;
+			valuesArray[_apiReturnedLines][2] = strstr(valuesArray[_apiReturnedLines][1], ",");
+			*valuesArray[_apiReturnedLines][2] = '\0';
+			valuesArray[_apiReturnedLines][2] += 1;
+			valuesArray[_apiReturnedLines][3] = strstr(valuesArray[_apiReturnedLines][2], ",");
+			*valuesArray[_apiReturnedLines][3] = '\0';
+			valuesArray[_apiReturnedLines][3] += 1;
+			valuesArray[_apiReturnedLines][4] = strstr(valuesArray[_apiReturnedLines][3], ",");
+			*valuesArray[_apiReturnedLines][4] = '\0';
+			valuesArray[_apiReturnedLines][4] += 1;
+
+			line = endLine + 1;
+
+			_apiReturnedLines++;
+		}
+
+		free(url);
+		return valuesArray;
+	}
+	free(url);
+	free(valuesArray);
+	return NULL;
+}
+
+// Download an asset file
+char* downloadAssetFile(char* app_id, char* url, char* type, char* orientation, char* asset_hash, char* destinationDir, struct AppStruct* appData)
+{
+	// Try creating folder
+	if (access(destinationDir, 0) != 0) {
+		mkdir(destinationDir, 0700);
+	}
+
+	CURL* curl;
+	FILE* fp;
+	CURLcode res;
+
+	char* outfilename = malloc(MAX_PATH);
+	strcpy(outfilename, destinationDir);
+	strcat(outfilename, app_id);
+	if (strcmp(type, "hero") == 0) {
+		// Hero
+		strcat(outfilename, "_hero");
+	}
+	else if (strcmp(type, "logo") == 0) {
+		// Logo
+		strcat(outfilename, "_logo");
+	}
+	else if (strcmp(type, "grid") == 0 && strcmp(orientation, "p") == 0) {
+		// Vertical grid
+		strcat(outfilename, "p");
+	}
+	else if (strcmp(type, "grid") == 0) {
+		// Horizontal grid has no suffix
+	}
+	else if (strcmp(type, "icon") == 0) {
+
+		if (appData != NULL) {
+			// Add _icon to nonsteam icons
+			strcat(outfilename, "_icon");
+
+		} else {
+			// Use hash for official Steam icons
+			strcat(outfilename, "/");
+			strcat(outfilename, asset_hash);
+		}
+	}
+
+	// Always save as jpg if icon and replacing default Steam
+	if (appData == NULL && strcmp(type, "icon") == 0) {
+		strcat(outfilename, ".jpg");
+	} else {
+		// Save as original file extension
+		const char* dot = strrchr(url, '.');
+		if (dot) {
+			char ext[16] = { 0 };
+			strncpy(ext, dot, sizeof(ext) - 1);
+			char* qmark = strchr(ext, '?');
+			if (qmark) *qmark = '\0'; // cut at '?'
+
+			// Don't use webp extensions
+			if (strcmp(ext, ".webp") == 0) {
+				strcpy(ext, ".png");
+			}
+			strcat(outfilename, ext);
+		} else {
+			strcat(outfilename, ".jpg"); // fallback
+		}
+	}
+
+
+	curl = curl_easy_init();
+	if (curl && outfilename != 0) {
+		cleanupOldAssetFiles(outfilename);
+
+		char* outfilename_temp = malloc(MAX_PATH);
+		strcpy(outfilename_temp, outfilename);
+		strcat(outfilename_temp, "_temp");
+
+		fp = fopen(outfilename_temp, "wb");
+		curl_easy_setopt(curl, CURLOPT_URL, url);
+		curl_easy_setopt(curl, CURLOPT_FAILONERROR, TRUE);
+		curl_easy_setopt(curl, CURLOPT_WRITEDATA, fp);
+		curl_easy_setopt(curl, CURLOPT_USERAGENT, API_USER_AGENT);
+		curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, TRUE);
+		res = curl_easy_perform(curl);
+		curl_easy_cleanup(curl);
+		fclose(fp);
+		if (res != 0) {
+			remove(outfilename_temp);
+			free(outfilename_temp);
+			free(outfilename);
+			return NULL;
+		}
+
+		// Rename the file to trigger a refresh on the client
+		if (!rename(outfilename_temp, outfilename)) {
+			free(outfilename_temp);
+			return outfilename;
+		}
+
+		free(outfilename_temp);
+	}
+
+	free(outfilename);
+	return NULL;
+}
+
+// Create the SGDB URI protocol
+int createURIprotocol() {
+
+	char* logFilepath = getLogFilepath();
+	char* popupMessage = malloc(1000);
+
+#if OS_Windows
+	char cwd[MAX_PATH];
+	GetModuleFileName(NULL, cwd, MAX_PATH);
+
+	char* regeditPath = malloc(2028);
+	strcpy(regeditPath, "\"");
+	strcat(regeditPath, cwd);
+	strcat(regeditPath, "\" \"%1\" -new_console:z");
+
+	if (!setWindowsRegistryString(HKEY_CLASSES_ROOT, "sgdb", "default", "URL:sgdb protocol")) {
+		char* ret_val_str = getWindowsRegistryString(HKEY_CLASSES_ROOT, "sgdb\\Shell\\Open\\Command", "default");
+		if (!ret_val_str) {
+			ShowMessageBox("steam-artwork-manager Error", "Please run this program as Administrator to register it!\n");
+			free(regeditPath);
+			return 1;
+		} else if (strcmp(ret_val_str, regeditPath) == 0) {
+			ShowMessageBoxW(L"steam-artwork-manager Information", L"steam-artwork-manager is already registered!\nHead over to https://www.steamgriddb.com/boop to continue setup.\n\nIf you moved the program and want to register again, run steam-artwork-manager as Administrator.\n");
+			free(regeditPath);
+			return 0;
+		} else {
+			ShowMessageBoxW(L"steam-artwork-manager Information", L"steam-artwork-manager is already registered at another filepath. Run this steam-artwork-manager executable as Administrator to register it.\n");
+			free(regeditPath);
+			return 1;
+		}
+	}
+
+	setWindowsRegistryString(HKEY_CLASSES_ROOT, "sgdb\\Shell\\Open\\Command", "default", regeditPath);
+
+	strcpy(regeditPath, "\"");
+	strcat(regeditPath, cwd);
+	strcat(regeditPath, "\"");
+
+	setWindowsRegistryString(HKEY_CLASSES_ROOT, "sgdb\\DefaultIcon", "default", regeditPath);
+	setWindowsRegistryString(HKEY_CLASSES_ROOT, "sgdb", "URL Protocol", "");
+
+	strcpy(popupMessage, "Program registered successfully!\n\nsteam-artwork-manager is meant to be ran from a browser!\nHead over to https://www.steamgriddb.com/boop to continue setup.");
+	strcat(popupMessage, "\n\nLog file path: ");
+	strcat(popupMessage, logFilepath);
+	strcat(popupMessage, "\n\nTo enable or disable debugging messages, run toggle_debug.bat");
+	ShowMessageBoxW(L"steam-artwork-manager Information", ConvertStringToUnicode(popupMessage));
+	free(regeditPath);
+	return 0;
+#elif OS_Linux
+	// Do nothing on linux
+	strcpy(popupMessage, "steam-artwork-manager is meant to be ran from a browser!\nHead over to https://www.steamgriddb.com/boop to continue setup.");
+	strcat(popupMessage, "\n\nLog file path: ");
+	strcat(popupMessage, logFilepath);
+	ShowMessageBox("steam-artwork-manager Information", popupMessage);
+	return 0;
+#elif OS_Mac
+	return macSetURLHandler();
+#else
+	return 0;
+#endif
+}
+
+// Delete the SGDB URI protocol
+int deleteURIprotocol() {
+#if OS_Windows
+	int ret_val = system("C:\\Windows\\System32\\reg.exe DELETE HKCR\\sgdb /f");
+	if (ret_val != 0) {
+		system("cls");
+		printf("Please run this program as Administrator!\n");
+		system("pause");
+		return 1;
+	}
+
+	system("cls");
+	printf("Program unregistered successfully!\n");
+	return 0;
+#elif OS_Linux
+	// Do nothing on linux
+	printf("A SGDB URL argument is required.\nExample: steam-artwork-manager sgdb://boop/[ASSET_TYPE]/[ASSET_ID]\n");
+	return 1;
+#elif OS_Mac
+	return 0;
+#endif
+}
+
+// Get Steam's base directory
+char* getSteamBaseDir() {
+
+	char* steamBaseDir = malloc(MAX_PATH);
+	int foundValue = 0;
+
+	if (getenv("BOOP_STEAMPATH") != NULL && strlen(getenv("BOOP_STEAMPATH")) > 0) {
+		strcpy(steamBaseDir, getenv("BOOP_STEAMPATH"));
+		return steamBaseDir;
+	}
+
+#if OS_Windows
+	char* steamPath = getWindowsRegistryString(HKEY_CURRENT_USER, "Software\\Valve\\Steam", "SteamPath");
+
+	if (steamPath != NULL) {
+		foundValue = 1;
+		strcpy(steamBaseDir, steamPath);
+	}
+#elif OS_Linux
+	foundValue = 1;
+	strcpy(steamBaseDir, getenv("HOME"));
+
+	char steamFlatpakDir[MAX_PATH];
+	strcpy(steamFlatpakDir, "/var/lib/flatpak/app/com.valvesoftware.Steam");
+
+	// If flatpaked Steam is installed
+	if (access(steamFlatpakDir, 0) == 0) {
+		strcat(steamBaseDir, "/.var/app/com.valvesoftware.Steam/data/Steam");
+	}
+	else {
+		// Steam installed on host
+		strcat(steamBaseDir, "/.steam/steam");
+	}
+#elif OS_Mac
+	foundValue = 1;
+	strcpy(steamBaseDir, getenv("HOME"));
+	strcat(steamBaseDir, "/Library/Application Support/Steam");
+#endif
+
+	if (foundValue < 1) {
+		free(steamBaseDir);
+		return NULL;
+	}
+
+	return steamBaseDir;
+}
+
+// Find the most recently logged-in user
+char* getMostRecentUserEx(char* steamBaseDir, int failOnExit) {
+
+	char* tempSteamid = malloc(512);
+	char* steamid = malloc(512);
+	char* steamConfigFile = malloc(MAX_PATH);
+	long long unsigned int latestTimestamp = 0;
+	strcpy(steamConfigFile, steamBaseDir);
+	strcat(steamConfigFile, "/config/loginusers.vdf");
+
+	FILE* fp;
+	char* line = NULL;
+	size_t len = 0;
+	size_t read;
+	fp = fopen(steamConfigFile, "r");
+	free(steamConfigFile);
+	if (fp == NULL) {
+		free(steamid);
+		free(tempSteamid);
+		if (failOnExit) {
+            exitWithError("Couldn't find logged in user", 95);
+        } else {
+            return NULL;
+        }
+	}
+
+	while ((read = readLine(&line, &len, fp)) != -1) {
+		if (strstr(line, "7656119") && !strstr(line, "PersonaName")) {
+			// Found line with id
+			strcpy(tempSteamid, strstr(line, "7656119"));
+			char* stringEnd = strstr(tempSteamid, "\"");
+			stringEnd[0] = '\0';
+		}
+		else if ((strstr(line, "timestamp") || strstr(line, "Timestamp"))) {
+			// Check if it's the most recent user
+			char * timestampString = strstr_i(line, "Timestamp") + 13;
+			strstr(timestampString, "\"")[0] = '\0';
+			long long unsigned int timestamp = atoll( timestampString );
+			if (timestamp > latestTimestamp) {
+				latestTimestamp = timestamp;
+				long long unsigned int steamidLongLong = atoll(tempSteamid);
+				steamidLongLong -= 76561197960265728;
+				sprintf(steamid, "%llu", steamidLongLong);
+			}
+		}
+	}
+
+	fclose(fp);
+	if (line)
+		free(line);
+	free(tempSteamid);
+
+	return steamid;
+}
+
+char* getMostRecentUser(char* steamBaseDir) {
+    return getMostRecentUserEx(steamBaseDir, 1);
+}
+
+// Get Steam's destination directory based on artwork type
+char* getSteamDestinationDir(char* type, struct AppStruct* appData) {
+
+	char* steamBaseDir = getSteamBaseDir();
+	if (steamBaseDir == NULL) {
+		return NULL;
+	}
+
+	if (strcmp(type, "icon") == 0 && appData == NULL) {
+		// If it's a Steam app icon
+		strcat(steamBaseDir, "/appcache/librarycache/");
+	}
+	else {
+		// If it's not a Steam app icon, read the loginusers.vdf to find the most recent user
+		char* steamid = getMostRecentUser(steamBaseDir);
+		strcat(steamBaseDir, "/userdata/");
+		strcat(steamBaseDir, steamid);
+		strcat(steamBaseDir, "/config/grid/");
+		free(steamid);
+	}
+
+	return steamBaseDir;
+}
+
+char* getModsPath(const char* type) {
+	int goldsource = 0;
+	if (strcmp(type, "goldsource") == 0) {
+		goldsource = 1;
+	}
+
+	// Get source mod install path
+	int foundValue = 0;
+	char* sourceModPath = malloc(MAX_PATH);
+	char regValue[50];
+
+	if (goldsource) {
+		// Goldsource mods
+		strcpy(regValue, "ModInstallPath");
+	}
+	else {
+		// Source mods
+		strcpy(regValue, "SourceModInstallPath");
+	}
+
+#if OS_Windows
+	// Windows: Query registry
+	char regeditCommand[200];
+
+	sourceModPath = getWindowsRegistryString(HKEY_CURRENT_USER, "Software\\Valve\\Steam", regValue);
+
+	if (sourceModPath != NULL) {
+		foundValue = 1;
+	}
+#else
+	// Linux: Read registry.vdf
+	FILE* fp_reg;
+	char* line_reg = NULL;
+	size_t len_reg = 0;
+	size_t read_reg;
+
+	// Fix reg value for registry.vdf
+	char regValueTemp[50];
+	strcpy(regValueTemp, "\"");
+	strcat(regValueTemp, regValue);
+	strcpy(regValue, regValueTemp);
+
+	// Registry is one dir up from the steam directory
+	char* regFileLocation = getSteamBaseDir();
+	char* regFileLocationTemp = regFileLocation;
+	while (*(regFileLocationTemp + 6) != '\x0') {
+		regFileLocationTemp = strstr_i(regFileLocationTemp, "/steam");
+	}
+	*regFileLocationTemp = '\x0';
+	strcat(regFileLocation, "/registry.vdf");
+	fp_reg = fopen(regFileLocation, "r");
+
+	// If the file doesn't exist, skip this function
+	if (fp_reg == NULL) {
+
+		// Try the old directory, inside the "steam" directory
+		regFileLocation = getSteamBaseDir();
+		strcat(regFileLocation, "/registry.vdf");
+		fp_reg = fopen(regFileLocation, "r");
+
+
+		// If the old file also doesn't exist, just ignore this type of mods
+		if (fp_reg == NULL) {
+			char errorMessage[500];
+			sprintf(errorMessage, "File registry.vdf could not be found in %s", regFileLocation);
+			free(regFileLocation);
+			logMessage(errorMessage, 96);
+			return NULL;
+		}
+	}
+
+	free(regFileLocation);
+
+	while ((read_reg = readLine(&line_reg, &len_reg, fp_reg)) != -1) {
+
+		// If line contains the regvalue's key, capture the value
+		unsigned char* extractedValue = strstr(line_reg, regValue);
+
+		if (extractedValue > 0) {
+			extractedValue += strlen(regValue) + 1;
+			extractedValue = strstr(extractedValue, "\"") + 1;
+
+			unsigned char* extractedValueEnd = strstr(extractedValue, "\"");
+			*extractedValueEnd = '\0';
+
+			strcpy(sourceModPath, extractedValue);
+			foundValue = 1;
+			break;
+		}
+	}
+	free(line_reg);
+
+	// Replace "//" with "\"
+	if (foundValue) {
+		sourceModPath = strreplace(sourceModPath, "\\\\", "/");
+	}
+#endif
+
+	if (!foundValue) {
+		// Allow this to fail silently, the registry key doesn't always need to be there
+		return NULL;
+	}
+
+	return sourceModPath;
+}
+
+// Get source mods appids
+struct AppStruct* getSourceMods(const char* type)
+{
+	int goldsource = 0;
+	if (strcmp(type, "goldsource") == 0) {
+		goldsource = 1;
+	}
+
+	char* sourceModPath = getModsPath(type);
+
+	if (sourceModPath == NULL)
+	{
+		free(sourceModPath);
+		return NULL;
+	}
+
+	char debug_message[1024];
+	if (DEBUG) {
+		sprintf(debug_message, "Opening mods path: %s\n", sourceModPath);
+		logMessage(debug_message, 0);
+	}
+
+	struct dirent* dir;
+	DIR* dr = opendir(sourceModPath);
+
+	if (dr == NULL)
+	{
+		free(sourceModPath);
+		return NULL;
+	}
+
+	// Iterate through each file
+	char* filepath = malloc(500);
+	char** sourceModsNames = malloc(sizeof(char*) * 500000);
+	int* sourceModsSteamAppIds = malloc(sizeof(char*) * 500000);
+	char** sourceModsDirs = malloc(sizeof(char*) * 500000);
+	unsigned int modsCount = 0;
+
+	while ((dir = readdir(dr)) != NULL)
+	{
+
+		// If file exists, parse it
+		strcpy(filepath, sourceModPath);
+		strcat(filepath, "/");
+		strcat(filepath, dir->d_name);
+
+		if (goldsource) {
+			// Goldsource mods
+			strcat(filepath, "/liblist.gam");
+		}
+		else {
+			// Source mods
+			strcat(filepath, "/gameinfo.txt");
+		}
+
+
+		FILE* fp;
+		char* line = NULL;
+		size_t len = 0;
+		size_t read;
+
+		fp = fopen(filepath, "r");
+
+		// If the file doesn't exist, move on to the next file
+		if (fp == NULL) {
+			continue;
+		}
+
+		int foundGameKey = 0;
+
+		if (DEBUG) {
+			sprintf(debug_message, "Reading file: %s\n", filepath);
+			logMessage(debug_message, 0);
+		}
+
+		while ((read = readLine(&line, &len, fp)) != -1) {
+
+			// If line contains the "game" key, get the mod's name and create the struct entry
+			unsigned char* commentChar = strstr(line, "//");
+			unsigned char* nameStartChar = strstr_i(line, "game");
+			unsigned char* steamAppIdStartChar = strstr_i(line, "SteamAppId");
+
+
+			if (DEBUG && nameStartChar > 0) {
+				sprintf(debug_message, "Found nameStartChar: %s\n", nameStartChar);
+				logMessage(debug_message, 0);
+			}
+
+			if (DEBUG && steamAppIdStartChar > 0) {
+				sprintf(debug_message, "Found steamAppIdStartChar: %s\n", steamAppIdStartChar);
+				logMessage(debug_message, 0);
+			}
+
+			// Make sure to first capture the "game" key, properly
+			if (nameStartChar > 0 && commentChar == 0 && !foundGameKey && ((char *) nameStartChar == line || isspace(*(nameStartChar - 1)) || *(nameStartChar - 1) == '"') && (isspace(*(nameStartChar + 4)) || *(nameStartChar + 4) == '"')) {
+
+				nameStartChar = strstr(nameStartChar + 5, "\"") + 1;
+				if (nameStartChar == 1) {
+					continue;
+				}
+				unsigned char* nameEndChar = strstr(nameStartChar, "\"");
+				*nameEndChar = '\0';
+
+				if (nameStartChar > 0) {
+					if (goldsource) {
+						// Skip folders that are supposed to be skipped
+						if (strcmp(dir->d_name, "bshift") == 0 ||
+							strcmp(dir->d_name, "cstrike") == 0 ||
+							strcmp(dir->d_name, "czero") == 0 ||
+							strcmp(dir->d_name, "czeror") == 0 ||
+							strcmp(dir->d_name, "dmc") == 0 ||
+							strcmp(dir->d_name, "dod") == 0 ||
+							strcmp(dir->d_name, "gearbox") == 0 ||
+							strcmp(dir->d_name, "ricochet") == 0 ||
+							strcmp(dir->d_name, "tfc") == 0 ||
+							strcmp(dir->d_name, "valve") == 0)
+						{
+							continue;
+						}
+					}
+
+					sourceModsNames[modsCount] = malloc(strlen(nameStartChar) + 1);
+					sourceModsDirs[modsCount] = malloc(strlen(dir->d_name) + 1);
+					strcpy(sourceModsNames[modsCount], nameStartChar);
+					strcpy(sourceModsDirs[modsCount], dir->d_name);
+
+					foundGameKey = 1;
+
+					if (goldsource) {
+						modsCount++;
+						break;
+					}
+				}
+			}
+			else if (steamAppIdStartChar > 0 && foundGameKey) {
+
+				// If line contains the "SteamAppId" key, get the mod's name and create the struct entry
+				unsigned char* steamAppIdStartChar = strstr(line, "SteamAppId");
+
+				// Extract steamAppId value
+				steamAppIdStartChar = strstr(line, "SteamAppId") + 10;
+				while (isspace(*steamAppIdStartChar)) {
+					steamAppIdStartChar++;
+				}
+				unsigned char* steamAppIdEndChar = steamAppIdStartChar;
+				while (!isspace(*steamAppIdEndChar)) {
+					steamAppIdEndChar++;
+				}
+				*steamAppIdEndChar = '\0';
+
+				if (steamAppIdStartChar > 0) {
+					sourceModsSteamAppIds[modsCount] = atoi(steamAppIdStartChar);
+
+					modsCount++;
+
+					break;
+				}
+			}
+		}
+
+		fclose(fp);
+		if (line)
+			free(line);
+	}
+	closedir(dr);
+	free(filepath);
+
+	free(sourceModPath);
+
+	if (goldsource) {
+		_goldSourceModsCount = modsCount;
+	}
+	else {
+		_sourceModsCount = modsCount;
+	}
+
+	struct AppStruct* sourceMods = malloc(sizeof(AppStruct) * modsCount);
+
+	if (DEBUG) {
+		sprintf(debug_message, "Found %u mods inside getSourceMods(%s)\n", modsCount, type);
+		logMessage(debug_message, 0);
+	}
+
+	for (unsigned int i = 0; i < modsCount; i++) {
+		sourceMods[i].index = _modsCount;
+		char int_string[50];
+		unsigned int hex_index = i;
+		if (goldsource) {
+			hex_index += _sourceModsCount; // Gold source mods mode must be called after normal source mods
+		}
+		sprintf(int_string, "%x", hex_index);
+		hex_index = (unsigned int)strtol(int_string, NULL, 16);
+
+		uint64_t appid_old = crcFast(sourceModsDirs[i], strlen(sourceModsDirs[i]));
+
+		if (goldsource) {
+			appid_old = (((appid_old | 0x80000000) << 32) | 0x02000000) - 0x1000000 + 70;
+		}
+		else {
+			appid_old = (((appid_old | 0x80000000) << 32) | 0x02000000) + sourceModsSteamAppIds[i] - 0x1000000;
+		}
+
+		sprintf(sourceMods[i].appid, "%lu", 2147483649 + hex_index);
+		strcpy(sourceMods[i].name, sourceModsNames[i]);
+		sprintf(sourceMods[i].appid_old, "%" PRIu64, appid_old);
+
+		free(sourceModsNames[i]);
+		free(sourceModsDirs[i]);
+	}
+
+	free(sourceModsNames);
+	free(sourceModsSteamAppIds);
+	free(sourceModsDirs);
+
+	return sourceMods;
+}
+
+uint32_t* getOwnedAppids(unsigned int* count) {
+
+	*count = 0;
+	uint32_t* ownedAppids = malloc(sizeof(uint32_t));
+
+	// Get the shortcuts.vdf file
+	char* packageinfoVdfPath = getSteamBaseDir();
+	strcat(packageinfoVdfPath, "/appcache/packageinfo.vdf");
+
+	// Parse the file
+	FILE* fp;
+	unsigned char buf[2] = { 0 };
+	size_t bytes = 0;
+	size_t read = sizeof buf;
+	fp = fopen(packageinfoVdfPath, "rb");
+	free(packageinfoVdfPath);
+	if (fp != NULL) {
+		fseek(fp, 0L, SEEK_END);
+		size_t filesize = ftell(fp) + 2;
+		fseek(fp, 0, SEEK_SET);
+
+		unsigned char* fileContent = malloc(filesize + 1);
+		memset(fileContent, '\xAB', filesize);
+		unsigned int currentFileByte = 0;
+
+		// Load the vdf in memory
+		while ((bytes = fread(buf, sizeof * buf, read, fp)) == read) {
+			for (int i = 0; i < sizeof buf; i++) {
+				fileContent[currentFileByte] = buf[i];
+				currentFileByte++;
+			}
+		}
+
+		fclose(fp);
+		const unsigned char* parsingChar = fileContent;
+		uint32_t appIdInt;
+		const unsigned char* appidBlockStart, *nextAppidBlock, *appId;
+		char message[512];
+
+		// Parse the vdf content
+		while ((size_t)(parsingChar - fileContent) < filesize) {
+
+			// Find appids block
+			appidBlockStart = sgdb_memmem(parsingChar, filesize - (parsingChar - fileContent), "appids\x00\x02\x30\x00", 10) + 7;
+			if ((size_t)(appidBlockStart - fileContent) > filesize) {
+				break;
+			}
+			nextAppidBlock = sgdb_memmem(appidBlockStart, filesize - (appidBlockStart - fileContent), "appids\x00\x02\x30\x00", 10);
+			if (nextAppidBlock - fileContent > filesize) {
+				nextAppidBlock = fileContent + filesize;
+			}
+
+			unsigned int appIdCount = 0;
+			unsigned char appIdIndex[10];
+
+			appId = appidBlockStart;
+			while (appId[0] == 0x02 && sprintf(appIdIndex, "%d", appIdCount) && startsWith((appId + 1), appIdIndex)) {
+
+				appId += 2 + strlen(appIdIndex);
+				appIdInt = (uint32_t)appId[0] |
+					((uint32_t)appId[1] << 8) |
+					((uint32_t)appId[2] << 16) |
+					((uint32_t)appId[3] << 24);
+
+				ownedAppids = realloc(ownedAppids, sizeof(uint32_t) * ((*count) + 1));
+				ownedAppids[(*count)++] = appIdInt;
+
+				appId += 4;
+				appIdCount++;
+
+				if (DEBUG) {
+					sprintf(message, "Found owned AppID: %d\n", appIdInt);
+					logMessage(message, 0);
+				}
+			}
+
+			parsingChar = nextAppidBlock;
+		}
+
+		free(fileContent);
+	}
+
+	if (DEBUG) {
+		char message[512];
+		sprintf(message, "Total owned apps: %d\n", *count);
+		logMessage(message, 0);
+	}
+
+	return ownedAppids;
+
+}
+
+// Parse appinfo file and return a pointer to a list of structs containing the app data
+struct AppStruct* getSteamApps() {
+
+	unsigned int ownedAppidsCount = 0;
+	uint32_t* ownedAppids = getOwnedAppids(&ownedAppidsCount);
+	char* appinfoVdfPath = getSteamBaseDir();
+	struct AppStruct* apps = malloc(sizeof(AppStruct));
+
+	// Get the shortcuts.vdf file
+	strcat(appinfoVdfPath, "/appcache/appinfo.vdf");
+
+	// Parse the file
+	FILE* fp;
+	unsigned char buf[2] = {0};
+	size_t bytes = 0;
+	size_t read = sizeof buf;
+	fp = fopen(appinfoVdfPath, "rb");
+	free(appinfoVdfPath);
+	if (fp != NULL) {
+		fseek(fp, 0L, SEEK_END);
+		size_t filesize = ftell(fp) + 2;
+		fseek(fp, 0, SEEK_SET);
+
+		unsigned char* fileContent = malloc(filesize + 1);
+		memset(fileContent, '\xAB', filesize);
+		unsigned int currentFileByte = 0;
+
+		// Load the vdf in memory
+		while ((bytes = fread(buf, sizeof * buf, read, fp)) == read) {
+			for (int i = 0; i < sizeof buf; i++) {
+				fileContent[currentFileByte] = buf[i];
+				currentFileByte++;
+			}
+		}
+
+		fclose(fp);
+		const unsigned char* parsingChar = fileContent;
+		uint32_t appIdInt;
+		unsigned char appidString[32];
+		const unsigned char *appIdStart, *appIdEnd, *appNameStart, * appStoreName, *nextAppId, *gameTypeMatch;
+		char message[1024];
+
+		// Parse the vdf content
+		while ((size_t)(parsingChar - fileContent) < filesize) {
+
+			// Find app name and appid
+			appIdStart = sgdb_memmem(parsingChar, filesize - (parsingChar - fileContent), "\x00\x00\x00\x00\x00\x02\x01\x00\x00\x00", 10) + 10;
+			if ((size_t)(appIdStart - fileContent) > filesize) {
+				break;
+			}
+			nextAppId = sgdb_memmem(appIdStart, filesize - (appIdStart - fileContent), "\x00\x00\x00\x00\x00\x02\x01\x00\x00\x00", 10) + 10;
+			if (nextAppId - fileContent > filesize) {
+				nextAppId = fileContent + filesize;
+			}
+			appIdInt = (uint32_t)appIdStart[0] |
+				((uint32_t)appIdStart[1] << 8) |
+				((uint32_t)appIdStart[2] << 16) |
+				((uint32_t)appIdStart[3] << 24);
+			sprintf(appidString, "%u", appIdInt);
+
+			appNameStart = sgdb_memmem(appIdStart, nextAppId - appIdStart, "\x01\x04\x00\x00\x00", 5) + 5;
+
+			if ((size_t)appNameStart == 5) {
+				parsingChar = appIdStart;
+				continue;
+			}
+
+			// Check if it's game type
+			gameTypeMatch = sgdb_memmem(appNameStart, nextAppId - appNameStart, "\x01\x05\x00\x00\x00game", 9) + 9;
+			if (gameTypeMatch > nextAppId || (size_t)gameTypeMatch == 9) {
+				gameTypeMatch = sgdb_memmem(appNameStart, nextAppId - appNameStart, "\x01\x05\x00\x00\x00Game", 9) + 9;
+			}
+
+			appStoreName = sgdb_memmem(appNameStart, nextAppId - appNameStart, "\x07\x02\x00\x00\x01\x91\x01\x00\x00", 9) + 9;
+			if ((size_t)appStoreName != 9 && appStoreName < nextAppId) {
+				appNameStart = appStoreName;
+			}
+
+			if (gameTypeMatch < nextAppId && (size_t)gameTypeMatch != 9) {
+
+				// Check if app is owned
+				uint8_t owned = FALSE;
+				for (unsigned int i = 0; i < ownedAppidsCount; i++) {
+					if (ownedAppids[i] == appIdInt) {
+						owned = TRUE;
+						break;
+					}
+				}
+
+				// Add app to array if it's owned
+				if (owned) {
+					// Realloc apps
+					apps = realloc(apps, sizeof(AppStruct) * (_steamAppsCount + 1));
+
+					// Add the values to struct
+					apps[_steamAppsCount].index = _steamAppsCount;
+					strcpy(apps[_steamAppsCount].name, appNameStart);
+					strcpy(apps[_steamAppsCount].appid, appidString);
+					strcpy(apps[_steamAppsCount].appid_old, appidString);
+					strcpy(apps[_steamAppsCount].type, "steam-app");
+					++_steamAppsCount;
+
+					if (DEBUG) {
+						sprintf(message, "Found app: [%s] \"%s\"\n", appidString, appNameStart);
+						logMessage(message, 0);
+					}
+				}
+			}
+
+			parsingChar = appNameStart + strlen(appNameStart);
+		}
+
+		printf("%d\n", _steamAppsCount);
+		free(fileContent);
+		free(ownedAppids);
+	}
+
+	return apps;
+}
+
+// Parse shortcuts file and return a pointer to a list of structs containing the app data
+struct AppStruct* getNonSteamApps() {
+
+	char* shortcutsVdfPath = getSteamBaseDir();
+	char* steamid = getMostRecentUser(shortcutsVdfPath);
+	struct AppStruct* apps = malloc(sizeof(AppStruct));
+	crcInit();
+
+	// Get the shortcuts.vdf file
+	strcat(shortcutsVdfPath, "/userdata/");
+	strcat(shortcutsVdfPath, steamid);
+	strcat(shortcutsVdfPath, "/config/shortcuts.vdf");
+
+	free(steamid);
+
+	// Parse the file
+	FILE* fp;
+	unsigned char buf[2] = { 0 };
+	size_t bytes = 0;
+	size_t read = sizeof buf;
+	fp = fopen(shortcutsVdfPath, "rb");
+	free(shortcutsVdfPath);
+	if (fp != NULL) {
+		fseek(fp, 0L, SEEK_END);
+		size_t filesize = ftell(fp) + 2;
+		fseek(fp, 0, SEEK_SET);
+
+		unsigned char* fileContent = malloc(filesize + 1);
+		memset(fileContent, '\xAB', filesize);
+		unsigned char* realFileContent = malloc(filesize + 1);
+		unsigned int currentFileByte = 0;
+
+		// Load the vdf in memory and fix string-related issues
+		while ((bytes = fread(buf, sizeof * buf, read, fp)) == read) {
+			for (int i = 0; i < sizeof buf; i++) {
+				if (buf[i] == 0x00) {
+					fileContent[currentFileByte] = 0x03;
+				}
+				else {
+					fileContent[currentFileByte] = buf[i];
+				}
+				realFileContent[currentFileByte] = buf[i];
+				currentFileByte++;
+			}
+		}
+		fileContent[filesize - 2] = '\x08';
+		fileContent[filesize - 1] = '\x03';
+		fileContent[filesize] = '\0';
+
+		fclose(fp);
+		unsigned char* parsingChar = fileContent;
+		unsigned char parsingAppid[512];
+		uint64_t intBytes[4];
+
+		// Parse the vdf content
+		while ((parsingChar - fileContent) < filesize && strstr_i(parsingChar, "appname") > 0) {
+
+			uint64_t appid_old = 0;
+			uint64_t appid = 0;
+
+			// Find app name
+			unsigned char* nameStartChar = strstr_i(parsingChar, "\001appname") + 9;
+			unsigned char* nameEndChar = strstr(nameStartChar, "\x03");
+
+			// Find exe path
+			unsigned char* exeStartChar = strstr_i(parsingChar, "\001exe") + 5;
+			unsigned char* exeEndChar = strstr(exeStartChar, "\x03");
+
+			unsigned char* appidPtr = strstr_i(parsingChar, "\002appid");
+			unsigned char* appBlockEndPtr = strstr(parsingChar, "\x08") + 1; // gcc fucks with optimization on strstr for 2 consecutive hex values. DON'T EDIT THIS.
+			while (*appBlockEndPtr != 0x03 && *appBlockEndPtr != 0x00) {
+				appBlockEndPtr = strstr(appBlockEndPtr, "\x08") + 1;
+			}
+
+			// If appid was found in this app block
+			if (appidPtr > 0 && appidPtr < appBlockEndPtr) {
+				unsigned char* hexBytes = realFileContent + (appidPtr - fileContent) + 7;
+				intBytes[0] = *(hexBytes + 3);
+				intBytes[1] = *(hexBytes + 2);
+				intBytes[2] = *(hexBytes + 1);
+				intBytes[3] = *(hexBytes + 0);
+
+				appid =
+					((uint64_t)intBytes[0] << 24) |
+					((uint64_t)intBytes[1] << 16) |
+					((uint64_t)intBytes[2] << 8) |
+					((uint64_t)intBytes[3] << 0);
+			}
+
+			// Calculate old app id
+			*nameEndChar = '\0';
+			*exeEndChar = '\0';
+
+			strcpy(parsingAppid, exeStartChar);
+			strcat(parsingAppid, nameStartChar);
+			appid_old = crcFast(parsingAppid, strlen(parsingAppid));
+			if (appid == 0) {
+				appid = appid_old;
+			}
+
+			*exeEndChar = '\x03';
+
+			// Realloc apps
+			apps = realloc(apps, sizeof(AppStruct) * (_nonSteamAppsCount + 1));
+
+			// Do math magic. Valve pls fix
+			appid = (((appid | 0x80000000) << 32) | 0x02000000) >> 32;
+			appid_old = (((appid_old | 0x80000000) << 32) | 0x02000000);
+			sprintf(apps[_nonSteamAppsCount].appid_old, "%" PRIu64, appid_old);
+
+			// Add the values to struct
+			apps[_nonSteamAppsCount].index = _nonSteamAppsCount;
+			strcpy(apps[_nonSteamAppsCount].name, nameStartChar);
+			sprintf(apps[_nonSteamAppsCount].appid, "%lu", (unsigned long)appid);
+			strcpy(apps[_nonSteamAppsCount].type, "nonsteam-app");
+			++_nonSteamAppsCount;
+
+
+			// Move parser to end of app data
+			*nameEndChar = 0x03; // Revert name string to prevent string-related problems
+			parsingChar = appBlockEndPtr + 2;
+		}
+
+		free(fileContent);
+		free(realFileContent);
+	}
+
+	return apps;
+}
+
+struct AppStruct* getMods() {
+	if (DEBUG) logMessage("Running getSourceMods(\"source\")", 0);
+	struct AppStruct* sourceMods = getSourceMods("source");
+
+	if (DEBUG) logMessage("Running getSourceMods(\"goldsource\")", 0);
+	struct AppStruct* goldSourceMods = getSourceMods("goldsource");
+
+	struct AppStruct* apps = malloc(sizeof(AppStruct) * (_sourceModsCount + _goldSourceModsCount));
+
+	char debug_message[1024];
+	if (DEBUG) {
+		sprintf(debug_message, "Found %u source mods and %u goldsrc mods\n", _sourceModsCount, _goldSourceModsCount);
+		logMessage(debug_message, 0);
+	}
+
+	for (unsigned int i = 0; i < _sourceModsCount; i++) {
+
+		if (DEBUG) {
+			sprintf(debug_message, "Adding source mod #%u: %s\n", i, sourceMods[i].name);
+			logMessage(debug_message, 0);
+		}
+
+		apps[_modsCount].index = _modsCount;
+		strcpy(apps[_modsCount].name, sourceMods[i].name);
+		strcpy(apps[_modsCount].appid_old, sourceMods[i].appid_old);
+		strcpy(apps[_modsCount].appid, sourceMods[i].appid);
+		strcpy(apps[_modsCount].type, "source-mod");
+
+		_modsCount++;
+	}
+	for (unsigned int i = 0; i < _goldSourceModsCount; i++) {
+
+		if (DEBUG) {
+			sprintf(debug_message, "Adding source mod #%u: %s\n", i, sourceMods[i].name);
+			logMessage(debug_message, 0);
+		}
+
+		apps[_modsCount].index = _modsCount;
+		strcpy(apps[_modsCount].name, goldSourceMods[i].name);
+		strcpy(apps[_modsCount].appid_old, goldSourceMods[i].appid_old);
+		strcpy(apps[_modsCount].appid, goldSourceMods[i].appid);
+		strcpy(apps[_modsCount].type, "goldsource-mod");
+
+		_modsCount++;
+	}
+	free(sourceMods);
+	free(goldSourceMods);
+
+	return apps;
+}
+
+// Select an app from a dropdown list and return its ID
+struct AppStruct* selectApp(char* sgdbName, struct AppStruct* appsNonSteam, struct AppStruct* appsMods, struct AppStruct* appsSteam) {
+
+	char** nonSteamValues = malloc(sizeof(char*) * _nonSteamAppsCount);
+	for (unsigned int i = 0; i < _nonSteamAppsCount; i++) {
+		nonSteamValues[i] = malloc(strlen(appsNonSteam[i].name) + 1);
+		strcpy(nonSteamValues[i], appsNonSteam[i].name);
+	}
+
+	char** modsValues = malloc(sizeof(char*) * _modsCount);
+	for (unsigned int i = 0; i < _modsCount; i++) {
+		modsValues[i] = malloc(strlen(appsMods[i].name) + 1);
+		strcpy(modsValues[i], appsMods[i].name);
+	}
+
+	char** steamValues = malloc(sizeof(char*) * _steamAppsCount);
+	for (unsigned int i = 0; i < _steamAppsCount; i++) {
+		steamValues[i] = malloc(strlen(appsSteam[i].name) + 1);
+		strcpy(steamValues[i], appsSteam[i].name);
+	}
+
+	struct AppStruct* appData = malloc(sizeof(AppStruct));
+
+	// Create title string
+	char* title = malloc(40 + strlen(sgdbName));
+	strcpy(title, "steam-artwork-manager: Pick a game for '");
+	strcat(title, sgdbName);
+	strcat(title, "'");
+
+	// Sort values
+	qsort(nonSteamValues, _nonSteamAppsCount, sizeof(const char*), compareStrings);
+	qsort(steamValues, _steamAppsCount, sizeof(const char*), compareStrings);
+	qsort(modsValues, _modsCount, sizeof(const char*), compareStrings);
+
+	// Find matching value
+	int selection = -1;
+	for (int i = 0; i < _nonSteamAppsCount; i++) {
+		if (strcmp_i(nonSteamValues[i], sgdbName) == 0) {
+			selection = i;
+			break;
+		}
+	}
+
+	if (selection < 0) {
+		for (int i = 0; i < _modsCount; i++) {
+			if (strcmp_i(modsValues[i], sgdbName) == 0) {
+				selection = i + _nonSteamAppsCount;
+				break;
+			}
+		}
+	}
+
+	// Create selection dialog
+	int retval = SelectionDialog(title, _nonSteamAppsCount, (const char**)nonSteamValues, _modsCount, (const char**)modsValues, _steamAppsCount, (const char**)steamValues, selection);
+
+	// Exit when user clicks cancel
+	if (retval < 0) {
+		free(appsNonSteam);
+		free(nonSteamValues);
+		free(appsMods);
+		free(modsValues);
+		free(appsSteam);
+		free(steamValues);
+		free(title);
+		exit(0);
+	}
+
+
+	// Find match
+	int matchCount;
+    struct AppStruct * matchedStruct;
+	char ** matchedValues;
+	if (retval >= _nonSteamAppsCount + _modsCount) {
+		retval -= _nonSteamAppsCount + _modsCount;
+		matchedStruct = appsSteam;
+		matchedValues = steamValues;
+		matchCount = _steamAppsCount;
+	} else if (retval >= _nonSteamAppsCount) {
+		retval -= _nonSteamAppsCount;
+		matchedStruct = appsMods;
+		matchedValues = modsValues;
+		matchCount = _modsCount;
+	} else {
+		matchedStruct = appsNonSteam;
+		matchedValues = nonSteamValues;
+        matchCount = _nonSteamAppsCount;
+    }
+
+	for (int i = 0; i < matchCount; i++) {
+		if (strcmp(matchedStruct[i].name, matchedValues[retval]) == 0) {
+			strcpy(appData->appid, matchedStruct[i].appid);
+			strcpy(appData->name, matchedStruct[i].name);
+			appData->index = matchedStruct[i].index;
+			strcpy(appData->appid_old, matchedStruct[i].appid_old);
+			strcpy(appData->type, matchedStruct[i].type);
+			break;
+		}
+	}
+
+	free(appsNonSteam);
+	free(nonSteamValues);
+	free(appsMods);
+	free(modsValues);
+	free(appsSteam);
+	free(steamValues);
+	free(title);
+
+	return appData;
+}
+
+// Update shortcuts.vdf with the new icon value
+void updateVdf(struct AppStruct* appData, char* filePath) {
+	char* shortcutsVdfPath = getSteamBaseDir();
+	char* steamid = getMostRecentUser(shortcutsVdfPath);
+
+	// Get the shortcuts.vdf file
+	strcat(shortcutsVdfPath, "/userdata/");
+	strcat(shortcutsVdfPath, steamid);
+	strcat(shortcutsVdfPath, "/config/shortcuts.vdf");
+
+	free(steamid);
+
+	// Parse the file
+	FILE* fp;
+	unsigned char buf[1] = { 0 };
+	size_t bytes = 0;
+	size_t read = sizeof buf;
+	fp = fopen(shortcutsVdfPath, "rb");
+	if (fp == NULL) {
+		exitWithError("Shortcuts vdf could not be found.", 93);
+	}
+	fseek(fp, 0L, SEEK_END);
+	size_t filesize = ftell(fp) + 2;
+	fseek(fp, 0, SEEK_SET);
+
+	unsigned char* fileContent = malloc(filesize + 1);
+	unsigned char* new_fileContent = malloc(filesize + 513);
+	unsigned int currentFileByte = 0;
+
+	// Load the vdf in memory and fix string-related issues
+	while ((bytes = fread(buf, sizeof * buf, read, fp)) == read) {
+		if (buf[0] == 0x00) {
+			fileContent[currentFileByte] = 0x03;
+		}
+		else {
+			fileContent[currentFileByte] = buf[0];
+		}
+		currentFileByte++;
+	}
+	fileContent[filesize - 2] = '\x08';
+	fileContent[filesize - 1] = '\x03';
+	fileContent[filesize] = '\0';
+	fclose(fp);
+
+	unsigned char* appBlockStart = fileContent;
+	unsigned char* appBlockEndPtr = fileContent;
+	unsigned char* iconStartChar = 0;
+	unsigned char* iconEndChar = 0;
+	char iconContent[512];
+	strcpy(iconContent, "\001icon\003");
+	strcat(iconContent, filePath);
+	strcat(iconContent, "\003");
+
+	// Find the app's block
+	for (int i = 0; i < appData->index + 1; i++) {
+		appBlockStart = appBlockEndPtr;
+		appBlockEndPtr = strstr(appBlockStart, "\x08") + 1; // gcc fucks with optimization on strstr for 2 consecutive hex values. DON'T EDIT THIS.
+		while (*appBlockEndPtr != 0x03 && *appBlockEndPtr != 0x00) {
+			appBlockEndPtr = strstr(appBlockEndPtr, "\x08") + 1;
+		}
+	}
+
+	if (appBlockStart > 0) {
+
+		// Find icon key
+		iconStartChar = strstr_i(appBlockStart, "\001icon");
+		iconEndChar = strstr(iconStartChar, "\x03") + 1;
+		iconEndChar = strstr(iconEndChar, "\x03");
+
+		// Find exe key
+		unsigned char* exeStartChar = strstr_i(appBlockStart, "\001exe") + 5;
+		unsigned char* exeEndChar = strstr(exeStartChar, "\x03");
+
+		if (iconStartChar == 0 || iconStartChar > appBlockEndPtr) {
+			// Didn't find icon block
+			iconStartChar = exeEndChar + 1;
+			iconEndChar = iconStartChar;
+		}
+
+		*iconStartChar = '\0';
+
+		// Set the new file contents
+		strcpy(new_fileContent, fileContent);
+		strcat(new_fileContent, iconContent);
+		strcat(new_fileContent, iconEndChar + 1);
+
+		// Write the file back
+		FILE* fp_w = fopen(shortcutsVdfPath, "wb");
+		if (fp_w == NULL) {
+			free(fileContent);
+			free(new_fileContent);
+			free(shortcutsVdfPath);
+			exitWithError("Could not write to shortcuts vdf file.", 94);
+		}
+
+		int newFileSize = strlen(new_fileContent) - 2;
+
+		for (int i = 0; i < newFileSize; i++) {
+			// Revert 0x03 to 0x00
+			if (new_fileContent[i] == 0x03) {
+				new_fileContent[i] = 0x00;
+			}
+
+			// Write byte to file
+			fwrite(&new_fileContent[i], sizeof(char), 1, fp_w);
+		}
+
+		fclose(fp_w);
+
+		free(fileContent);
+		free(new_fileContent);
+		free(shortcutsVdfPath);
+	}
+}
+
+char* getExecutableDirectory(char* executablePath) {
+	char separator[2];
+#if defined(OS_Windows)
+	strcpy(separator, "\\");
+#else
+	strcpy(separator, "/");
+#endif
+
+	char* executableDir = malloc(MAX_PATH), *executableDirTemp = executableDir;
+	strcpy(executableDir, executablePath);
+
+	while (strstr(executableDirTemp, separator)) {
+		executableDirTemp = strstr(executableDirTemp, separator) + 1;
+	}
+
+	*executableDirTemp = '\x0';
+	return executableDir;
+}
+
+// Build as Windows app on windows instead of console
+#if OS_Windows
+int APIENTRY WinMain(HINSTANCE hInst, HINSTANCE hInstPrev, PSTR cmdline, int cmdshow)
+{
+	int argc = __argc;
+	char** argv = __argv;
+	ShowWindow(GetConsoleWindow(), 0);
+#else
+int main(int argc, char** argv)
+{
+#endif
+
+#ifdef OS_Mac	
+	// if param is not passed directly we're probs being launched via url
+	if (!startsWith(argv[argc > 1 ? 1 : 0], "sgdb://")) {
+		const char* aeUrl = macAwaitEvent();
+		if (aeUrl != NULL) {
+			// override argv if launched via event
+			static char* fakeArgv[2];
+			// The first param is always the binary, second is the sgdb://
+			fakeArgv[0] = argv[0];
+			fakeArgv[1] = (char*)aeUrl;
+			argc = 2;
+			argv = fakeArgv;
+		}
+	}
+#endif
+
+	// Check for debug enablers
+	DEBUG = getenv("steam-artwork-manager_DEBUG") != NULL && !strcmp(getenv("steam-artwork-manager_DEBUG"), "1");
+	char debugFilePath[MAX_PATH];
+	strcpy(debugFilePath, getExecutableDirectory(argv[0]));
+	strcat(debugFilePath, "/steam-artwork-manager_DEBUG");
+	FILE* f = fopen(debugFilePath, "r");
+	if (f != NULL) {
+		DEBUG = 1;
+		fclose(f);
+	}
+
+	if (DEBUG) logMessage("Enabled debugging log", 0);
+
+	// If no arguments were given, register the program
+	if (argc == 0 || (argc == 1 && !startsWith(argv[0], "sgdb://"))) {
+
+		if (DEBUG) logMessage("Attempting to register URI protocol", 0);
+
+		// Create the sgdb URI protocol
+		if (createURIprotocol() == 1) {
+			exitWithError("Could not create URI protocol.", 80);
+		}
+	}
+	else {
+
+		// If argument is unregister, unregister and exit
+		if (strcmp(argv[1], "unregister") == 0) {
+
+			if (DEBUG) logMessage("Attempting to unregister URI protocol", 0);
+
+			if (deleteURIprotocol() == 1) {
+				exitWithError("Could not unregister the URI protocol.", 85);
+			}
+			return 0;
+		}
+
+		// If sgdb:// arguments were passed, run program normally
+
+		// If the arguments aren't of the SGDB URI, return with an error
+		if (!startsWith(argv[1], "sgdb://boop")) {
+			exitWithError("Invalid URI schema.", 81);
+		}
+
+		// Test mode
+		if (strcmp(argv[1], "sgdb://boop/test") == 0) {
+
+			if (DEBUG) logMessage("Attempting to show test popup, starting with getSteamBaseDir.", 0);
+			char* steamBaseDir = getSteamBaseDir();
+
+			if (DEBUG) logMessage("Running getLogFilepath", 0);
+			char* logFilepath = getLogFilepath();
+
+			if (DEBUG) logMessage("Running getMostRecentUserEx", 0);
+			char* mostRecentUser = getMostRecentUserEx(steamBaseDir, 0);
+
+			if (DEBUG) logMessage("Running getModsPath(\"source\")", 0);
+			char* sourceModPath = getModsPath("source");
+
+			if (DEBUG) logMessage("Running getModsPath(\"goldsource\")", 0);
+			char* goldSrcModPath = getModsPath("goldsource");
+
+			if (DEBUG) logMessage("Prepping test message", 0);
+
+			char* message = malloc(1024);
+			strcpy(message, "(ノ◕ヮ◕)ノ*:・゚✧   steam-artwork-manager is working!  ★・゚:*ヽ(◕ヮ◕ヽ)\n\n");
+			strcat(message, "Version: " VERSION "\n");
+			strcat(message, "\nLast logged in user: ");
+			strcat(message, mostRecentUser != NULL ? mostRecentUser : "(not found)");
+			strcat(message, "\n\n");
+			strcat(message, "Steam directory:\n");
+			strcat(message, steamBaseDir != NULL ? steamBaseDir : "(not found)");
+			strcat(message, "\n\n");
+			strcat(message, "Source mods:\n");
+			strcat(message, sourceModPath != NULL ? sourceModPath : "(not found)");
+			strcat(message, "\n\n");
+			strcat(message, "GoldSrc mods:\n");
+			strcat(message, goldSrcModPath != NULL ? goldSrcModPath : "(not found)");
+			strcat(message, "\n\n");
+			strcat(message, "Log file:\n");
+			strcat(message, logFilepath);
+			strcat(message, "\n\nDebug logging: ");
+			strcat(message, DEBUG ? "Enabled" : "Disabled");
+
+			if (DEBUG) logMessage("Showing test message", 0);
+
+			// Show a message
+			#if OS_Windows
+			ShowMessageBoxW(L"steam-artwork-manager Test", ConvertStringToUnicode(message));
+			#else
+			ShowMessageBox("steam-artwork-manager Test", message);
+			#endif
+
+			if (DEBUG) logMessage("Showed test message", 0);
+			
+			free(message);
+			return 0;
+		}
+
+
+		if (DEBUG) logMessage("Extracting params from argument.", 0);
+
+		// Get the params from the string
+		char* types = strstr(argv[1], "sgdb://boop/") + strlen("sgdb://boop/");
+		char* grid_ids = strstr(types, "/");
+		grid_ids[0] = '\0';         // End app_id string
+		grid_ids += 1;              // Move 1 place
+
+		char* mode = strstr(grid_ids, "/"); // If there's a method string, use it
+		if (mode > 0) {
+			*mode = '\0';
+			mode++;
+		}
+		else {
+			mode = malloc(sizeof("default") + 1);
+			strcpy(mode, "default");
+		}
+
+		if (DEBUG) logMessage("Getting asset URL.", 0);
+
+		// Get asset URL
+		char*** apiValues = callAPI(types, grid_ids, mode);
+		if (apiValues == NULL) {
+			exitWithError("API didn't return an appropriate response.", 82);
+		}
+
+		// Use the same app object for all calls
+		struct AppStruct* appData = NULL;
+
+		if (DEBUG) logMessage("Running main boop loop", 0);
+
+		for (int line = 0; line < _apiReturnedLines; line++) {
+
+			if (DEBUG) logMessage("Extracting api response values", 0);
+
+			char* app_id = apiValues[line][0];
+			char* orientation = apiValues[line][1];
+			char* assetUrl = apiValues[line][2];
+			char* asset_type = apiValues[line][3];
+			char* asset_hash = apiValues[line][4];
+
+			if (DEBUG) {
+				logMessage("Extracting api response values", 0);
+				char message[1024];
+				sprintf(message, "app_id: %s, asset_type: %s, orientation: %s, assetUrl: %s, asset_hash: %s\n", app_id, asset_type, orientation, assetUrl, asset_hash);
+				logMessage(message, 0);
+			}
+
+			// If the game is a non-steam app, select an imported app
+			if (startsWith(app_id, "nonsteam-")) {
+
+				if (DEBUG) logMessage("Found non-steam appid", 0);
+
+				// Select app once
+				if (line < 1) {
+					// Do not include mods in the dropdown list if the only asset selected was an icon
+					uint8_t includeMods = TRUE;
+					if (strcmp(types, "icon") == 0 || (strcmp(types, "steam") == 0 && strcmp(asset_type, "icon") == 0)) {
+						includeMods = FALSE;
+					}
+
+					// Get apps
+					if (DEBUG) logMessage("Running getNonSteamApps", 0);
+					struct AppStruct* appsNonSteam = getNonSteamApps();
+
+					if (DEBUG) logMessage("Running getSteamApps", 0);
+					struct AppStruct* appsSteam = getSteamApps();
+
+					struct AppStruct* appsMods = NULL;
+					if (includeMods) {
+						if (DEBUG) logMessage("Running getMods", 0);
+						appsMods = getMods();
+					}
+
+					if (DEBUG) {
+						logMessage("Assessing found apps", 0);
+						char message[1024];
+						sprintf(message, "_nonSteamAppsCount: %u, _modsCount: %u, _steamAppsCount: %u\n", _nonSteamAppsCount, _modsCount, _steamAppsCount);
+						logMessage(message, 0);
+					}
+
+					// Exit with an error if nothing found
+					if (_nonSteamAppsCount < 1 && _modsCount < 1 && _steamAppsCount < 1) {
+						ShowMessageBox("steam-artwork-manager Error", "Could not find any non-Steam apps or mods.");
+						free(appsNonSteam);
+						free(appsSteam);
+						free(appsMods);
+						exitWithError("Could not find any non-Steam apps or mods.", 91);
+					}
+
+					if (DEBUG) logMessage("Running selectApp", 0);
+
+					// Show selection screen and return the struct
+					appData = selectApp(strstr(app_id, "-") + 1, appsNonSteam, appsMods, appsSteam);
+				}
+
+				// Skip icons for source/goldsource mods
+				if (strcmp(asset_type, "icon") == 0 &&
+					(strcmp(appData->type, "source-mod") == 0 || strcmp(appData->type, "goldsource-mod") == 0)) {
+					continue;
+				}
+
+				app_id = appData->appid;
+			} else if (strcmp(asset_type, "icon") == 0 && strcmp(asset_hash, "notfound") == 0) {
+
+				// If the requested asset is an official Steam icon that was not found in the api, skip this asset
+				continue;
+			}
+
+			// Get Steam base dir
+			if (DEBUG) logMessage("Running getSteamDestinationDir", 0);
+			char* steamDestDir = getSteamDestinationDir(asset_type, appData);
+			if (steamDestDir == NULL) {
+				exitWithError("Could not locate Steam destination directory.", 83);
+			}
+
+			// Download asset file
+			if (DEBUG) {
+				logMessage("Preparing to download asset.", 0);
+				char message[1024];
+				sprintf(message, "app_id: %s, asset_type: %s, orientation: %s, assetUrl: %s, asset_hash: %s, steamDestDir: %s\n", app_id, asset_type, orientation, assetUrl, asset_hash, steamDestDir);
+				logMessage(message, 0);
+			}
+
+			char* outfilename = downloadAssetFile(app_id, assetUrl, asset_type, orientation, asset_hash, steamDestDir, appData);
+			if (outfilename == NULL) {
+				exitWithError("Could not download asset file.", 84);
+			}
+
+			// Non-Steam specific actions
+			if (appData) {
+				// If the asset is a non-Steam icon, add the path to the vdf
+				if (strcmp(asset_type, "icon") == 0) {
+					if (DEBUG) logMessage("Running updateVdf", 0);
+					updateVdf(appData, outfilename);
+				}
+
+			}
+
+			free(outfilename);
+			free(steamDestDir);
+		}
+
+		if (DEBUG) logMessage("Finished main boop loop.", 0);
+
+		free(appData);
+	}
+
+	return 0;
+}

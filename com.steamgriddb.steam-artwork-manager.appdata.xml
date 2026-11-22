@@ -1,0 +1,231 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.steamgriddb.steam-artwork-manager</id>
+  <name>steam-artwork-manager</name>
+  <launchable type="desktop-id">com.steamgriddb.steam-artwork-manager.desktop</launchable>
+  <categories>
+    <category>Utility</category>
+    <category>Game</category>
+  </categories>
+  <metadata_license>FSFAP</metadata_license>
+  <project_license>Zlib</project_license>
+  <content_rating type="oars-1.0" />
+  <releases>
+    <release version="1.4.4" date="2026-10-04">
+      <description>
+        <ul>
+          <li>Fixed icons not applying.</li>
+          <li>Fixed some Source mods not being detected.</li>
+          <li>Added more debug info for mods.</li>
+          <li>Fixed some memory leaks.</li>
+        </ul>
+      </description>
+    </release>
+    <release version="1.4.3" date="2026-08-02">
+      <description>
+        <ul>
+          <li>Fixed some Steam apps not showing in Steam tab.</li>
+          <li>Fixed Steam app titles showing app name instead of Store name. Now properly matches the name shown in the client.</li>
+          <li>Fixed memory leak when showing API error.</li>
+        </ul>
+      </description>
+    </release>
+    <release version="1.4.2" date="2026-08-01">
+      <description>
+        <ul>
+          <li>Fixed an overflow bug in the test popup that was causing it not to show up</li>
+          <li>Added basic debugging logging</li>
+          <li>Renamed log file to steam-artwork-manager.log</li>
+        </ul>
+      </description>
+    </release>
+    <release version="1.4.1" date="2026-07-23">
+      <description>
+        <ul>
+          <li>Fixed crashes related to invalid mod paths for Linux releases</li>
+        </ul>
+      </description>
+    </release>
+    <release version="1.4.0" date="2026-07-23">
+      <description>
+        <ul>
+          <li>steam-artwork-manager is now built and distributed for the ARM architecture</li>
+          <li>Added ability to apply assets to other Steam games via the (+) button.</li>
+          <li>Added ability to override the Steam base directory via the `BOOP_STEAMPATH` env var.</li>
+          <li>Updated the test popup to show some debug info, so users can potentially spot issues with their setup.</li>
+          <li>Fixed non-Steam games not being found on the latest version of Steam.</li>
+          <li>Fixed images in the Steam client sometimes looking corrupt/blank until a restart when on a slow network connection.</li>
+          <li>Fixed issue where some official Steam assets wont apply due to not following URL redirects.</li>
+          <li>Fixed some Source mods not being detected.</li>
+          <li>Fixed tons of crashes, memory leaks, edge cases.</li>
+        </ul>
+      </description>
+    </release>
+    <release version="1.3.2" date="2026-03-16">
+      <description>
+        <ul>
+          <li>Fixed Non-Steam Games not working for some users</li>
+          <li>Fixed permission check for Steam Flatpak</li>
+        </ul>
+      </description>
+    </release>
+    <release version="1.3.1" date="2025-04-15">
+      <description>
+        <ul>
+          <li>Fixed animated assets not applying.</li>
+        </ul>
+      </description>
+    </release>
+    <release version="1.3.0" date="2025-04-15">
+      <description>
+        <ul>
+          <li>Added tabs to seperate Non-Steam shortcuts and GoldSrc/Source mods.</li>
+          <li>Fixed applying icons to Steam games.</li>
+          <li>Fixed Steam Flatpak installation check.</li>
+          <li>Fixed memory leaks.</li>
+          <li>Removed IUP dependency. GTK3 is now used for GUI.</li>
+          <li>Removed legacy symlinking of horizontal capsules.</li>
+          <li>Keep original file extension while saving assets.</li>
+          <li>Major code cleanup.</li>
+        </ul>
+      </description>
+    </release>
+    <release version="1.2.8" date="2023-06-09">
+      <description>
+        <ul>
+          <li>Fixed booping non-Steam shortcuts not working for some users.</li>
+        </ul>
+      </description>
+    </release>
+    <release version="1.2.7" date="2023-03-11">
+      <description>
+        <ul>
+          <li>Update appdata to make it easier to find by @pktiuk in #46</li>
+          <li>Appid may contain special bytes. by @Xzonn in #50</li>
+        </ul>
+      </description>
+    </release>
+    <release version="1.2.6" date="2022-09-10">
+      <description>
+        <ul>
+          <li>Fixed logging for Flatpak version.</li>
+          <li>Showing logfile location when launched normally (via double click or through Discover).</li>
+          <li>Disabled logging of URI protocol creations errors for linux.</li>
+          <li>(Steam Deck) Mods stored in the MicroSD card are now properly accessed.</li>
+        </ul>
+      </description>
+    </release>
+    <release version="1.2.5" date="2022-09-09">
+      <description>
+        <ul>
+          <li>Fixed logging for Flatpak version.</li>
+          <li>Showing logfile location when launched normally (via double click or through Discover).</li>
+          <li>(Steam Deck) Mods stored in the MicroSD card are now properly accessed.</li>
+        </ul>
+      </description>
+    </release>
+    <release version="1.2.4" date="2022-09-08">
+      <description>
+        <ul>
+          <li>Fixed logging for linux.</li>
+        </ul>
+      </description>
+    </release>
+    <release version="1.2.3" date="2022-08-29">
+      <description>
+        <ul>
+          <li>Final Release (unless something major breaks).</li>
+          <li>Added API User Agent.</li>
+        </ul>
+      </description>
+    </release>
+    <release version="1.2.2" date="2022-08-27">
+      <description>
+        <ul>
+          <li>Fix crash when scanning for some source mods.</li>
+        </ul>
+      </description>
+    </release>
+    <release version="1.2.1" date="2022-08-26">
+      <description>
+        <p>v1.2.1:</p>
+        <ul>
+          <li>Fix Big Picture Mode assets not loading for Non-Steam shortcuts.</li>
+        </ul>
+        <p>v1.2.0:</p>
+        <ul>
+          <li>Ability to change icons for non-Steam apps.</li>
+          <li>Support for Source and GoldSrc mods.</li>
+          <li>Boop default Steam assets onto non-Steam apps.</li>
+          <li>Added "sgdb://boop/test" to test if steam-artwork-manager is launching from the browser properly.</li>
+          <li>Functionality to apply multiple assets to a single app at once.</li>
+          <li>Error logging.</li>
+          <li>Fixed bugs.</li>
+        </ul>
+      </description>
+    </release>
+    <release version="1.2.0" date="2022-08-22">
+      <description>
+        <ul>
+          <li>Ability to change icons for non-Steam apps.</li>
+          <li>Support for Source and GoldSrc mods.</li>
+          <li>Boop default Steam assets onto non-Steam apps.</li>
+          <li>Added "sgdb://boop/test" to test if steam-artwork-manager is launching from the browser properly.</li>
+          <li>Functionality to apply multiple assets to a single app at once.</li>
+          <li>Error logging.</li>
+          <li>Fixed bugs.</li>
+        </ul>
+      </description>
+    </release>
+    <release version="1.1.0" date="2022-05-11">
+      <description>
+        <p>Added ability to change assets for non-Steam apps.</p>
+      </description>
+    </release>
+    <release version="1.0.13" date="2022-05-06"/>
+    <release version="1.0.12" date="2022-04-28"/>
+  </releases>
+  <screenshots>
+    <screenshot type="default">
+      <caption>Custom assets in Steam library</caption>
+      <image>https://github.com/SteamGridDB/steam-artwork-manager/raw/main/res/screenshots/in-library.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Adding assets to non-Steam apps</caption>
+      <image>https://github.com/SteamGridDB/steam-artwork-manager/raw/main/res/screenshots/nonsteam-selector.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Button to press to trigger steam-artwork-manager</caption>
+      <image>https://github.com/SteamGridDB/steam-artwork-manager/raw/main/res/screenshots/apply-with-boop.png</image>
+    </screenshot>
+  </screenshots>
+  <summary>Apply SteamGridDB assets to Steam</summary>
+  <description>
+    <p>
+      A tool that automatically applies assets from SteamGridDB directly to your Steam library, removing the need to download and set them manually.
+    </p>
+    <p>
+      Note: steam-artwork-manager is intended to be executed via sgdb:// links on SteamGridDB.
+    </p>
+    <p>
+      Continue setup from "Step 2" here: https://www.steamgriddb.com/boop
+    </p>
+  </description>
+  <branding>
+    <color type="primary" scheme_preference="light">#96ccf2</color>
+    <color type="primary" scheme_preference="dark">#32414c</color>
+  </branding>
+  <url type="homepage">https://www.steamgriddb.com/boop</url>
+  <url type="bugtracker">https://github.com/SteamGridDB/steam-artwork-manager/issues</url>
+  <url type="donation">https://www.patreon.com/steamgriddb</url>
+  <url type="contribute">https://github.com/SteamGridDB/steam-artwork-manager</url>
+  <url type="vcs-browser">https://github.com/SteamGridDB/steam-artwork-manager</url>
+  <developer_name>SteamGridDB</developer_name>
+  <keywords>
+    <keyword translate="no">Steam</keyword>
+    <keyword translate="no">SteamGridDB</keyword>
+    <keyword translate="no">Deck</keyword>
+    <keyword>Artwork</keyword>
+    <keyword>Cover</keyword>
+  </keywords>
+</component>

@@ -1,0 +1,10 @@
+# This .desktop will only be used with the flatpak
+[Desktop Entry]
+Name=steam-artwork-manager
+Comment=Apply Steam assets from SteamGridDB
+Exec=steam-artwork-manager %U
+Terminal=false
+Type=Application
+Icon=com.steamgriddb.steam-artwork-manager
+MimeType=x-scheme-handler/sgdb
+Categories=Utility
